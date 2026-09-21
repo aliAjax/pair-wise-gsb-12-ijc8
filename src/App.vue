@@ -1,190 +1,173 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { useDockStore } from "./stores/dockStore";
+import {
+  statusMeta,
+  type Reservation,
+  type ReservationStatus
+} from "./domain/types";
+import { formatDateTime } from "./domain/time";
+import BookingForm from "./components/BookingForm.vue";
+import ConflictPanel from "./components/ConflictPanel.vue";
+import DockBoard from "./components/DockBoard.vue";
+import HistoryPanel from "./components/HistoryPanel.vue";
+import ReservationCard from "./components/ReservationCard.vue";
+import ReleaseDialog from "./components/ReleaseDialog.vue";
+import RescheduleDialog from "./components/RescheduleDialog.vue";
+import CancelLoadingDialog from "./components/CancelLoadingDialog.vue";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = useDockStore();
 
-type RecordItem = {
-  id: string;
-  status: string;
+const filterOptions: Array<{ key: ReservationStatus | "active" | "all"; label: string }> = [
+  { key: "active", label: "进行中" },
+  { key: "all", label: "全部" },
+  { key: "reserved", label: statusMeta.reserved.label },
+  { key: "checkedIn", label: statusMeta.checkedIn.label },
+  { key: "loading", label: statusMeta.loading.label },
+  { key: "released", label: statusMeta.released.label },
+  { key: "cancelled", label: "已取消/超时" }
+];
+const filter = ref<(typeof filterOptions)[number]["key"]>("active");
+const plateQuery = ref("");
+
+const filtered = computed(() => {
+  const list = store.reservations.filter((item) => {
+    if (filter.value === "active" && ["released", "cancelled", "noShow"].includes(item.status)) {
+      return false;
+    }
+    if (
+      filter.value === "cancelled" &&
+      !(item.status === "cancelled" || item.status === "noShow")
+    ) {
+      return false;
+    }
+    if (
+      !["active", "all", "cancelled"].includes(filter.value) &&
+      item.status !== filter.value
+    ) {
+      return false;
+    }
+    if (plateQuery.value.trim() && !item.plate.includes(plateQuery.value.trim().toUpperCase())) {
+      return false;
+    }
+    return true;
+  });
+  return [...list].sort((a, b) => {
+    const rank = (s: ReservationStatus) =>
+      s === "loading" ? 0 : s === "checkedIn" ? 1 : s === "reserved" ? 2 : 3;
+    const ra = rank(a.status);
+    const rb = rank(b.status);
+    if (ra !== rb) return ra - rb;
+    return new Date(b.startAt).getTime() - new Date(a.startAt).getTime();
+  });
+});
+
+const metrics = computed(() => [
+  { label: "待入场", value: store.reservations.filter((r) => r.status === "reserved").length },
+  {
+    label: "场内占用",
+    value: store.reservations.filter((r) => r.status === "checkedIn" || r.status === "loading")
+      .length
+  },
+  { label: "累计放行", value: store.reservations.filter((r) => r.status === "released").length }
+]);
+
+function dockOf(id: string) {
+  return store.dockById(id);
+}
+
+function rebookTargetOf(item: Reservation) {
+  if (!item.rebookedTo) return null;
+  return store.reservations.find((r) => r.id === item.rebookedTo) ?? null;
+}
+
+// ---------- 对话框状态 ----------
+const releaseTarget = ref<Reservation | null>(null);
+const releaseError = ref<string | null>(null);
+const rescheduleTarget = ref<Reservation | null>(null);
+const cancelLoadingTarget = ref<Reservation | null>(null);
+const formVersion = ref(0);
+
+// ---------- 动作 ----------
+function handleBook(input: {
+  plate: string;
+  tempZone: string;
+  dockId: string;
+  startAt: string;
+  endAt: string;
   notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
-
-const project = {
-  "number": 3,
-  "folder": "dfwl/frontend/dfwlfront-3",
-  "framework": "vue",
-  "title": "车辆调度小工具",
-  "subtitle": "维护车辆、司机和任务状态，为空闲车辆分配配送任务。",
-  "industry": "物流",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Naive UI"
-  ],
-  "storageKey": "dfwlfront-3-dispatch",
-  "formTitle": "新增配送任务",
-  "primaryAction": "分配任务",
-  "entityLabel": "车辆",
-  "statuses": [
-    "空闲",
-    "执行中",
-    "已完成"
-  ],
-  "filters": [
-    "全部区域",
-    "城北",
-    "城东",
-    "城南"
-  ],
-  "fields": [
-    {
-      "key": "vehicle",
-      "label": "车牌号"
-    },
-    {
-      "key": "driver",
-      "label": "司机"
-    },
-    {
-      "key": "zone",
-      "label": "配送区域",
-      "type": "select",
-      "options": [
-        "城北",
-        "城东",
-        "城南"
-      ]
-    },
-    {
-      "key": "task",
-      "label": "配送任务"
-    }
-  ],
-  "records": [
-    {
-      "vehicle": "沪A-82L6",
-      "driver": "董飞",
-      "zone": "城北",
-      "task": "商超补货",
-      "status": "空闲",
-      "notes": "可立即派车"
-    },
-    {
-      "vehicle": "沪B-73K9",
-      "driver": "周航",
-      "zone": "城东",
-      "task": "医药配送",
-      "status": "执行中",
-      "notes": "预计17:30返回"
-    }
-  ],
-  "metricLabels": [
-    "车辆总数",
-    "执行中",
-    "空闲车辆"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
+}) {
+  const created = store.book(input);
+  if (created) {
+    formVersion.value += 1;
   }
 }
 
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
+function openRelease(item: Reservation) {
+  releaseTarget.value = item;
+  releaseError.value = null;
+}
 
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+function confirmRelease(payload: {
+  sealNo: string;
+  netWeight: number | null;
+  releaseNotes: string;
+}) {
+  if (!releaseTarget.value) return;
+  const ok = store.completeRelease(releaseTarget.value.id, payload);
+  if (ok) {
+    releaseTarget.value = null;
+    releaseError.value = null;
+  } else {
+    releaseError.value = store.conflicts[0]?.detail ?? store.conflicts[0]?.ruleLabel ?? null;
+  }
+}
+
+function openReschedule(item: Reservation) {
+  rescheduleTarget.value = item;
+  store.clearConflicts();
+}
+
+function confirmReschedule(payload: { dockId: string; startAt: string; endAt: string }) {
+  if (!rescheduleTarget.value) return;
+  const target = rescheduleTarget.value;
+  const created = store.reschedule(target.id, {
+    plate: target.plate,
+    tempZone: target.tempZone,
+    dockId: payload.dockId,
+    startAt: payload.startAt,
+    endAt: payload.endAt
+  });
+  if (created) rescheduleTarget.value = null;
+}
+
+function openCancelLoading(item: Reservation) {
+  cancelLoadingTarget.value = item;
+  store.clearConflicts();
+}
+
+function confirmCancelLoading(payload: { reason: string; startAt: string; endAt: string }) {
+  if (!cancelLoadingTarget.value) return;
+  const created = store.cancelLoadingWithRebook(cancelLoadingTarget.value.id, payload.reason, {
+    startAt: payload.startAt,
+    endAt: payload.endAt
+  });
+  if (created) cancelLoadingTarget.value = null;
+}
+
+function confirmCancelReserved(item: Reservation) {
+  if (window.confirm(`确认取消 ${item.plate} 的预约并释放装卸位？`)) {
+    store.cancelReserved(item.id);
+  }
+}
+
+// ---------- 超时自动释放轮询 ----------
+let timer: number | undefined;
+onMounted(() => {
+  store.tick();
+  timer = window.setInterval(() => store.tick(), 30 * 1000);
 });
-
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
-
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
-}
-
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
-}
-
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
-}
+onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
 <template>
@@ -192,78 +175,108 @@ function remove(id: string) {
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">物流园区 · 装卸位预约与放行闭环</p>
+          <h1>园区装卸位预约与放行</h1>
+          <p class="subtitle">
+            预约车牌、温区、装卸位与时段；冷链车只能使用冷藏位，装卸位时段不得重叠，超时未入场自动释放。
+            入场锁定预约，装卸完成录入铅封号、净重与备注后方可放行。
+          </p>
         </div>
         <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+          <span class="tag">Vue3</span>
+          <span class="tag">TypeScript</span>
+          <span class="tag">Pinia</span>
+          <span class="tag">localStorage</span>
         </div>
       </header>
 
       <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
+        <article v-for="item in metrics" :key="item.label" class="metric">
+          <span>{{ item.label }}</span>
+          <strong>{{ item.value }}</strong>
         </article>
       </section>
 
+      <ConflictPanel :conflicts="store.conflicts" @dismiss="store.clearConflicts()" />
+
       <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
+        <BookingForm
+          :key="formVersion"
+          :docks="store.docks"
+          :on-validate="store.checkBooking"
+          submit-label="提交预约"
+          :submitting="false"
+          @submit="handleBook"
+          @cancel="formVersion += 1"
+        />
 
         <section class="list-panel">
           <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
+            <h2>预约列表</h2>
+            <div class="toolbar-controls">
+              <input v-model="plateQuery" class="plate-search" placeholder="按车牌搜索" />
+              <select v-model="filter">
+                <option v-for="item in filterOptions" :key="item.key" :value="item.key">
+                  {{ item.label }}
+                </option>
+              </select>
+            </div>
           </div>
+          <p class="clock-line">当前时间：{{ formatDateTime(store.now) }}（每 30 秒检查超时未入场）</p>
 
           <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
-            </div>
+            <div v-if="filtered.length === 0" class="empty">暂无匹配预约</div>
+            <ReservationCard
+              v-for="item in filtered"
+              :key="item.id"
+              :reservation="item"
+              :dock="dockOf(item.dockId)"
+              :rebook-target="rebookTargetOf(item)"
+              @check-in="store.checkIn"
+              @start-loading="store.startLoading"
+              @release="openRelease"
+              @reschedule="openReschedule"
+              @cancel-loading="openCancelLoading"
+              @cancel-reserved="confirmCancelReserved"
+            />
           </div>
         </section>
       </section>
+
+      <DockBoard :docks="store.docks" :reservations="store.reservations" :now="store.now" />
+
+      <HistoryPanel :events="store.releaseHistory" />
+
+      <footer class="page-foot">
+        <button type="button" class="secondary" @click="store.resetDemo()">恢复演示数据</button>
+        <span class="muted">数据保存在浏览器 localStorage，刷新后预约、占用与放行历史保持一致。</span>
+      </footer>
     </div>
+
+    <ReleaseDialog
+      :open="releaseTarget !== null"
+      :reservation="releaseTarget"
+      :error-detail="releaseError"
+      @close="releaseTarget = null"
+      @confirm="confirmRelease"
+    />
+    <RescheduleDialog
+      :open="rescheduleTarget !== null"
+      :reservation="rescheduleTarget"
+      :docks="store.docks"
+      :conflicts="store.conflicts"
+      :on-validate="store.checkBooking"
+      @close="rescheduleTarget = null"
+      @confirm="confirmReschedule"
+    />
+    <CancelLoadingDialog
+      :open="cancelLoadingTarget !== null"
+      :reservation="cancelLoadingTarget"
+      :docks="store.docks"
+      :conflicts="store.conflicts"
+      :on-validate="store.checkBooking"
+      @close="cancelLoadingTarget = null"
+      @confirm="confirmCancelLoading"
+    />
   </main>
 </template>
